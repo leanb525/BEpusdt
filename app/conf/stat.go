@@ -3,9 +3,33 @@ package conf
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 const maxRecords = 1000
+
+var endpointCooldown sync.Map // key: endpoint URL string, value: time.Time (冷却到期时间)
+
+// MarkEndpointBad 将某个 RPC 端点临时标记为不可用，PickEndpoint 在 d 时间内会跳过它
+func MarkEndpointBad(endpoint string, d time.Duration) {
+	if endpoint == "" || d <= 0 {
+		return
+	}
+	endpointCooldown.Store(endpoint, time.Now().Add(d))
+}
+
+// IsEndpointBad 判断某个 RPC 端点当前是否处于冷却中；过期会顺手清理
+func IsEndpointBad(endpoint string) bool {
+	v, ok := endpointCooldown.Load(endpoint)
+	if !ok {
+		return false
+	}
+	if time.Now().Before(v.(time.Time)) {
+		return true
+	}
+	endpointCooldown.Delete(endpoint)
+	return false
+}
 
 type stat struct {
 	mu      sync.RWMutex

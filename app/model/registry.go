@@ -390,10 +390,11 @@ func IsAmountValid(t TradeType, d decimal.Decimal) bool {
 }
 
 func Endpoint(net Network) string {
-	if endpointKey, ok := networkEndpointMap[net]; ok {
-		return GetC(endpointKey)
+	if _, ok := networkEndpointMap[net]; !ok {
+		return ""
 	}
-	return ""
+
+	return PickEndpoint(net)
 }
 
 func GetTradeAtomKey(t TradeType) (ConfKey, bool) {

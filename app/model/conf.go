@@ -39,6 +39,8 @@ var defaultConf = map[ConfKey]string{
 	NotifyMaxRetry:          "10",
 	BlockHeightMaxDiff:      "1000",
 	BlockOffsetConfirm:      "0",
+	EvmBlockParseMaxNumBsc:  "10",
+	EvmBlockDispatchPoolBsc: "3",
 	PaymentTimeout:          "1200", // 20分钟
 	PaymentMatchMode:        string(Classic),
 	SystemInstallLock:       "0",

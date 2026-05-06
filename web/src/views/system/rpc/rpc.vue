@@ -55,23 +55,27 @@
                 <a-col :xs="24" :sm="24" :md="12">
                   <a-form-item
                     field="rpc_endpoint_tron"
-                    label="Tron RPC"
                     :rules="[{ required: true, message: '请输入Tron RPC' }]"
                     class="network-form-item"
                   >
-                    <a-input
+                    <template #label>
+                      <div class="tron-grid-label">
+                        <span class="label-with-tip">
+                          <span>Tron RPC</span>
+                          <a-tooltip content="支持多个节点，每行一个，自动轮询并故障切换" position="top">
+                            <icon-question-circle class="tip-icon" />
+                          </a-tooltip>
+                        </span>
+                      </div>
+                    </template>
+                    <a-textarea
                       v-model="formData.rpc_endpoint_tron"
-                      placeholder="请输入 Tron RPC"
+                      placeholder="请输入 Tron RPC，多个节点每行一个"
                       allow-clear
                       size="small"
                       class="network-input tron-input"
-                    >
-                      <template #prefix>
-                        <div class="input-icon">
-                          <icon-link />
-                        </div>
-                      </template>
-                    </a-input>
+                      :auto-size="{ minRows: 1, maxRows: 6 }"
+                    />
                   </a-form-item>
                 </a-col>
                 <a-col :span="24">
@@ -135,23 +139,97 @@
                 >
                   <a-form-item
                     :field="network.key"
-                    :label="network.label"
                     :rules="[{ required: true, message: `请输入${network.label}` }]"
                     class="network-form-item"
                   >
-                    <a-input
+                    <template #label>
+                      <div class="tron-grid-label">
+                        <span class="label-with-tip">
+                          <span>{{ network.label }}</span>
+                          <a-tooltip content="支持多个节点，每行一个，自动轮询并故障切换" position="top">
+                            <icon-question-circle class="tip-icon" />
+                          </a-tooltip>
+                        </span>
+                      </div>
+                    </template>
+                    <a-textarea
                       v-model="formData[network.key]"
-                      :placeholder="`请输入 ${network.label}`"
+                      :placeholder="`请输入 ${network.label}，多个节点每行一个`"
                       allow-clear
                       size="small"
                       class="network-input"
-                    >
-                      <template #prefix>
-                        <div class="input-icon">
-                          <component :is="network.icon" />
-                        </div>
-                      </template>
-                    </a-input>
+                      :auto-size="{ minRows: 1, maxRows: 6 }"
+                    />
+                  </a-form-item>
+                </a-col>
+              </a-row>
+            </div>
+
+            <!-- BSC 扫块高级参数 -->
+            <div class="evm-tuning-section">
+              <div class="section-header">
+                <div class="header-icon">
+                  <icon-thunderbolt />
+                </div>
+                <span class="header-title">BSC 扫块高级参数</span>
+                <span class="section-tip">仅作用于 BSC，公网 RPC 节点出现限流时建议调小</span>
+              </div>
+
+              <a-row :gutter="[16, 6]">
+                <a-col :xs="24" :sm="24" :md="12">
+                  <a-form-item
+                    field="evm_block_parse_max_num_bsc"
+                    :rules="[{ required: true, type: 'number', positive: true, message: '请输入正整数' }]"
+                    class="network-form-item"
+                  >
+                    <template #label>
+                      <div class="tron-grid-label">
+                        <span class="label-with-tip">
+                          <span>BSC 单次扫块区块数</span>
+                          <a-tooltip
+                            content="BSC 单次 eth_getLogs 调用覆盖的区块数量上限。公共节点频繁报 limit exceeded 时建议调小（如 5）；自建节点可加大提高吞吐。默认 10。"
+                            position="top"
+                          >
+                            <icon-question-circle class="tip-icon" />
+                          </a-tooltip>
+                        </span>
+                      </div>
+                    </template>
+                    <a-input
+                      v-model="formData.evm_block_parse_max_num_bsc"
+                      placeholder="默认 10"
+                      allow-clear
+                      size="small"
+                      class="network-input"
+                    />
+                  </a-form-item>
+                </a-col>
+                <a-col :xs="24" :sm="24" :md="12">
+                  <a-form-item
+                    field="evm_block_dispatch_pool_bsc"
+                    :rules="[{ required: true, type: 'number', positive: true, message: '请输入正整数' }]"
+                    class="network-form-item"
+                  >
+                    <template #label>
+                      <div class="tron-grid-label">
+                        <span class="label-with-tip">
+                          <span>BSC 区块消费并发数</span>
+                          <a-tooltip
+                            content="BSC 区块解析的并发 worker 数量。公共节点限流明显时建议设为 1；自建节点可加大。修改后需要重启服务生效。默认 3。"
+                            position="top"
+                          >
+                            <icon-question-circle class="tip-icon" />
+                          </a-tooltip>
+                        </span>
+                      </div>
+                    </template>
+                    <a-input
+                      v-model="formData.evm_block_dispatch_pool_bsc"
+                      placeholder="默认 3"
+                      allow-clear
+                      size="small"
+                      class="network-input"
+                    />
                   </a-form-item>
                 </a-col>
               </a-row>
@@ -217,7 +295,7 @@ const networks = [
 
 const infoList = [
   { icon: IconCheckCircle, text: "RPC节点是与区块链网络通信的关键接口，请确保所配置的节点稳定可靠" },
-  { icon: IconStar, text: "建议使用官方推荐的RPC节点或知名的第三方服务商" },
+  { icon: IconStar, text: "每个网络支持多个 RPC 节点，每行一个；系统会自动轮询并在节点限流或异常时临时切换到其他节点" },
   { icon: IconThunderbolt, text: "配置前请先测试节点的连通性和响应速度" },
   { icon: IconFire, text: "修改配置后系统将立即生效，请谨慎操作" }
 ];
@@ -231,7 +309,12 @@ const originalData = ref<Record<string, string>>({});
 const getConf = async () => {
   try {
     loading.value = true;
-    const keys = [...networks.map(network => network.key), "rpc_endpoint_tron_grid_api_key"];
+    const keys = [
+      ...networks.map(network => network.key),
+      "rpc_endpoint_tron_grid_api_key",
+      "evm_block_parse_max_num_bsc",
+      "evm_block_dispatch_pool_bsc"
+    ];
 
     const response = await getsConfAPI({ keys });
     const data = response.data || {};
@@ -240,6 +323,8 @@ const getConf = async () => {
       formData[network.key] = data[network.key] || "";
     });
     formData.rpc_endpoint_tron_grid_api_key = data.rpc_endpoint_tron_grid_api_key || "";
+    formData.evm_block_parse_max_num_bsc = data.evm_block_parse_max_num_bsc || "10";
+    formData.evm_block_dispatch_pool_bsc = data.evm_block_dispatch_pool_bsc || "3";
 
     originalData.value = { ...formData };
   } catch (error) {
@@ -291,6 +376,16 @@ const handleSave = async () => {
     saveData.push({
       key: "rpc_endpoint_tron_grid_api_key",
       value: tronApiKey
+    });
+
+    // BSC 扫块高级参数
+    saveData.push({
+      key: "evm_block_parse_max_num_bsc",
+      value: formData.evm_block_parse_max_num_bsc?.trim() || "10"
+    });
+    saveData.push({
+      key: "evm_block_dispatch_pool_bsc",
+      value: formData.evm_block_dispatch_pool_bsc?.trim() || "3"
     });
 
     await setsConfAPI(saveData);
@@ -449,6 +544,62 @@ onMounted(() => {
       font-weight: 600;
       font-size: 13px;
       color: $color-text-1;
+    }
+  }
+}
+
+// EVM 扫块高级参数区域样式 - 使用柔和的蓝色系
+.evm-tuning-section {
+  background: rgba(var(--primary-6), 0.05);
+  border: 1px solid rgba(var(--primary-6), 0.18);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  position: relative;
+  overflow: hidden;
+
+  &::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: rgba(var(--primary-6), 0.72);
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid $color-border-2;
+
+    .header-icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      background: $color-primary;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 11px;
+      box-shadow: 0 2px 4px rgba(var(--primary-6), 0.3);
+    }
+
+    .header-title {
+      font-weight: 600;
+      font-size: 13px;
+      color: $color-text-1;
+    }
+
+    .section-tip {
+      font-size: 11px;
+      font-weight: normal;
+      color: $color-text-3;
+      margin-left: auto;
     }
   }
 }
