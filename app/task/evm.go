@@ -28,6 +28,8 @@ const (
 	blockDispatchPoolNum = 3  // 区块消费 worker 默认数量；可通过 EvmBlockDispatchPool 覆盖
 	evmTransferEvent     = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 	evmEndpointCooldown  = 30 * time.Second // 端点限流/网络错误后的冷却时长
+	evmBlockMaxAttempts  = 5                // 单个区块范围最大重试次数，超过则丢弃，避免坏 range 无限循环把成功率指标拖花
+	evmRpcTimeout        = 20 * time.Second // 单次扫块 RPC 总超时；BSC 公共节点 Parse=true 时 3-8s 常态，留出足够余量
 )
 
 // errRateLimited 标识 RPC 限流类错误（-32005 / "limit exceeded" / HTTP 429 等），上层据此做端点冷却 + 区间二分
@@ -105,8 +107,21 @@ func (e *evm) dispatchPool() int {
 }
 
 type evmBlock struct {
-	From int64
-	To   int64
+	From     int64
+	To       int64
+	Attempts int // 已重试次数；每次 requeue 自增，达到 evmBlockMaxAttempts 后丢弃
+}
+
+// requeue 把扫块任务重新入队列；超过最大重试次数则丢弃并告警，防止坏 range 无限循环
+func (e *evm) requeue(b evmBlock) {
+	b.Attempts++
+	if b.Attempts >= evmBlockMaxAttempts {
+		log.Task.Error(fmt.Sprintf("%s 区块扫描重试超过 %d 次已放弃：%d → %d", e.Network, evmBlockMaxAttempts, b.From, b.To))
+
+		return
+	}
+
+	e.blockScanQueue.In <- b
 }
 
 func (e *evm) syncBlocksForward(ctx context.Context) {
@@ -238,7 +253,7 @@ func (e *evm) blockDispatch(ctx context.Context) {
 			return
 		case n := <-e.blockScanQueue.Out:
 			if err := p.Invoke(n); err != nil {
-				e.blockScanQueue.In <- n
+				e.requeue(n)
 
 				log.Task.Warn("Evm Block Dispatch Error invoking process block:", err)
 			}
@@ -249,10 +264,20 @@ func (e *evm) blockDispatch(ctx context.Context) {
 func (e *evm) getBlockByNumber(a any) {
 	b, ok := a.(evmBlock)
 	if !ok {
-		log.Task.Warn("Evm Block Parse Error: expected []int64, got", a)
+		log.Task.Warn("Evm Block Parse Error: expected evmBlock, got", a)
 
 		return
 	}
+
+	// 单出口指标记录：函数结束时统一记一次成功或失败，避免一次调用同时写入 success + failure 把成功率锚定在 50%
+	success := false
+	defer func() {
+		if success {
+			conf.RecordSuccess(e.Network)
+		} else {
+			conf.RecordFailure(e.Network)
+		}
+	}()
 
 	endpoint := model.PickEndpoint(model.Network(e.Network))
 	if endpoint == "" {
@@ -266,7 +291,7 @@ func (e *evm) getBlockByNumber(a any) {
 		items = append(items, fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x%x",%t],"id":%d}`, i, e.Native.Parse, i))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	ctx, cancel := context.WithTimeout(context.Background(), evmRpcTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer([]byte(fmt.Sprintf(`[%s]`, strings.Join(items, ",")))))
@@ -279,9 +304,8 @@ func (e *evm) getBlockByNumber(a any) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := e.Client.Do(req)
 	if err != nil {
-		conf.RecordFailure(e.Network)
 		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
-		e.blockScanQueue.In <- b
+		e.requeue(b)
 		log.Task.Warn("eth_getBlockByNumber Error sending request:", err)
 
 		return
@@ -291,16 +315,14 @@ func (e *evm) getBlockByNumber(a any) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		conf.RecordFailure(e.Network)
 		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
-		e.blockScanQueue.In <- b
+		e.requeue(b)
 		log.Task.Warn("eth_getBlockByNumber Error reading response body:", err)
 
 		return
 	}
 
 	if isRateLimitErr(resp.StatusCode, string(body)) {
-		conf.RecordFailure(e.Network)
 		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
 		e.requeueOnRateLimit(b)
 		log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber rate limited, endpoint=%s status=%d", e.Network, endpoint, resp.StatusCode))
@@ -308,14 +330,11 @@ func (e *evm) getBlockByNumber(a any) {
 		return
 	}
 
-	conf.RecordSuccess(e.Network)
-
 	nativeTransfers := make([]transfer, 0)
 	blockTimestamp := make(map[string]time.Time)
 	for _, itm := range gjson.ParseBytes(body).Array() {
 		if itm.Get("error").Exists() {
 			errStr := itm.Get("error").String()
-			conf.RecordFailure(e.Network)
 
 			if isRateLimitErr(0, errStr) {
 				conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
@@ -325,7 +344,7 @@ func (e *evm) getBlockByNumber(a any) {
 				return
 			}
 
-			e.blockScanQueue.In <- b
+			e.requeue(b)
 			log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber response error %s", e.Network, errStr))
 
 			return
@@ -343,10 +362,8 @@ func (e *evm) getBlockByNumber(a any) {
 		}
 	}
 
-	transfers, err := e.parseEventTransfer(endpoint, b, blockTimestamp)
+	transfers, err := e.parseEventTransfer(ctx, endpoint, b, blockTimestamp)
 	if err != nil {
-		conf.RecordFailure(e.Network)
-
 		if errors.Is(err, errRateLimited) {
 			conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
 			e.requeueOnRateLimit(b)
@@ -355,7 +372,7 @@ func (e *evm) getBlockByNumber(a any) {
 			return
 		}
 
-		e.blockScanQueue.In <- b
+		e.requeue(b)
 		log.Task.Warn("Evm Block Parse Error parsing block transfer:", err)
 
 		return
@@ -368,22 +385,24 @@ func (e *evm) getBlockByNumber(a any) {
 		transferQueue.In <- transfers
 	}
 
+	success = true
 	log.Task.Info(fmt.Sprintf("区块扫描完成(%s): %d → %d 成功率：%s", e.Network, b.From, b.To, conf.GetSuccessRate(e.Network)))
 }
 
 // requeueOnRateLimit 命中限流时把当前区块范围二分后重新入队，避免相同范围的请求立刻打回同样限流的端点；
-// 单块限流时退避 1 秒后整段重入，等待端点冷却或下次切换到其他端点
+// 单块限流时退避 1 秒后整段重入，等待端点冷却或下次切换到其他端点；
+// 子段继承原 Attempts 计数，由 requeue 自增并触发上限丢弃，防止无限循环
 func (e *evm) requeueOnRateLimit(b evmBlock) {
 	if b.From >= b.To {
 		time.Sleep(time.Second)
-		e.blockScanQueue.In <- b
+		e.requeue(b)
 
 		return
 	}
 
 	mid := b.From + (b.To-b.From)/2
-	e.blockScanQueue.In <- evmBlock{From: b.From, To: mid}
-	e.blockScanQueue.In <- evmBlock{From: mid + 1, To: b.To}
+	e.requeue(evmBlock{From: b.From, To: mid, Attempts: b.Attempts})
+	e.requeue(evmBlock{From: mid + 1, To: b.To, Attempts: b.Attempts})
 }
 
 func (e *evm) parseNativeTransfer(array []gjson.Result, num int, timestamp time.Time) []transfer {
@@ -429,13 +448,20 @@ func (e *evm) parseNativeTransfer(array []gjson.Result, num int, timestamp time.
 	return nativeTransfers
 }
 
-func (e *evm) parseEventTransfer(endpoint string, b evmBlock, timestamp map[string]time.Time) ([]transfer, error) {
+func (e *evm) parseEventTransfer(ctx context.Context, endpoint string, b evmBlock, timestamp map[string]time.Time) ([]transfer, error) {
 	transfers := make([]transfer, 0)
 	post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x","topics":["%s"]}],"id":1}`, b.From, b.To, evmTransferEvent))
-	resp, err := e.Client.Post(endpoint, "application/json", bytes.NewBuffer(post))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(post))
 	if err != nil {
 
-		return transfers, errors.Join(errors.New("eth_getLogs Post Error"), err)
+		return transfers, errors.Join(errors.New("eth_getLogs NewRequest Error"), err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := e.Client.Do(req)
+	if err != nil {
+
+		return transfers, errors.Join(errors.New("eth_getLogs Do Error"), err)
 	}
 
 	defer resp.Body.Close()
