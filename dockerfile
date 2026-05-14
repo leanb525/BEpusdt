@@ -1,7 +1,7 @@
 FROM node:25.2.1 AS web_builder
 
 # 安装 pnpm
-RUN npm install -g pnpm
+RUN npm install -g pnpm@10
 
 WORKDIR /web
 COPY web/package.json web/pnpm-lock.yaml ./
@@ -11,7 +11,7 @@ RUN pnpm install --frozen-lockfile --shamefully-hoist
 COPY web/ ./
 RUN pnpm run build:prod
 
-FROM golang:1.24.3-alpine3.20 AS builder
+FROM golang:1.26.2-alpine3.23 AS builder
 
 ENV GO111MODULE=on
 WORKDIR /go/release
