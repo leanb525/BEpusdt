@@ -284,6 +284,7 @@ func init() {
 		if c.Contract != "" {
 			contractDecimalMap[c.Contract] = c.Decimal
 			contractTradeMap[c.Contract] = t
+			networkContractsMap[c.Network] = append(networkContractsMap[c.Network], c.Contract)
 		}
 		if c.AmountRange != (Range{}) {
 			tradeAmountRangeMap[t] = c.AmountRange
@@ -337,6 +338,17 @@ func GetContractTrade(addr string) (TradeType, bool) {
 	t, ok := contractTradeMap[addr]
 
 	return t, ok
+}
+
+// GetNetworkContracts 返回某条网络上 registry 里登记的全部合约地址；
+// 用于 eth_getLogs 的 address 过滤，避免被部分公共节点要求 address 强制过滤的限流策略命中
+func GetNetworkContracts(n Network) []string {
+	list, ok := networkContractsMap[n]
+	if !ok {
+		return nil
+	}
+
+	return list
 }
 
 func GetContractDecimal(addr string) int32 {

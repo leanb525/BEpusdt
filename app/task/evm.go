@@ -28,6 +28,7 @@ const (
 	blockDispatchPoolNum = 3  // 区块消费 worker 默认数量；可通过 EvmBlockDispatchPool 覆盖
 	evmTransferEvent     = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 	evmEndpointCooldown  = 30 * time.Second // 端点限流/网络错误后的冷却时长
+	evmEndpointBadCfgCD  = 10 * time.Minute // 配置不匹配类错误（如 chain id 不对、方法不支持）的端点冷却时长，长时间踢出轮询
 	evmBlockMaxAttempts  = 5                // 单个区块范围最大重试次数，超过则丢弃，避免坏 range 无限循环把成功率指标拖花
 	evmRpcTimeout        = 20 * time.Second // 单次扫块 RPC 总超时；BSC 公共节点 Parse=true 时 3-8s 常态，留出足够余量
 )
@@ -35,7 +36,44 @@ const (
 // errRateLimited 标识 RPC 限流类错误（-32005 / "limit exceeded" / HTTP 429 等），上层据此做端点冷却 + 区间二分
 var errRateLimited = errors.New("rpc rate limited")
 
+// errBadEndpoint 标识端点本身就不该被使用（链 id 不对、方法不支持等），上层据此做长冷却，把端点踢出轮询
+var errBadEndpoint = errors.New("rpc endpoint mismatch")
+
 var chainBlockNum sync.Map
+
+// isBadChainErr 判断响应是否属于"端点根本不支持当前链"或"方法/参数不支持"类错误；
+// 这些错误重试同一端点没有意义，应当将端点踢出轮询较长时间
+func isBadChainErr(errMsg string) bool {
+	if errMsg == "" {
+		return false
+	}
+	low := strings.ToLower(errMsg)
+	if strings.Contains(low, "invalid chain") {
+		return true
+	}
+	if strings.Contains(low, "unsupported chain") {
+		return true
+	}
+	if strings.Contains(low, "wrong chain") {
+		return true
+	}
+	if strings.Contains(low, "chain not supported") {
+		return true
+	}
+	if strings.Contains(low, "method not found") {
+		return true
+	}
+	if strings.Contains(low, "method not supported") {
+		return true
+	}
+	if strings.Contains(low, "-32601") { // jsonrpc method not found
+		return true
+	}
+	if strings.Contains(low, "-32001") { // 部分实现用 -32001 表示 invalid chain
+		return true
+	}
+	return false
+}
 
 // isRateLimitErr 判断 jsonrpc error 字符串或 HTTP 状态码是否属于限流类
 func isRateLimitErr(httpStatus int, errMsg string) bool {
@@ -130,8 +168,9 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 		return
 	}
 
+	endpoint := e.rpcEndpoint()
 	post := []byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}`)
-	req, err := http.NewRequestWithContext(ctx, "POST", e.rpcEndpoint(), bytes.NewBuffer(post))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(post))
 	if err != nil {
 		log.Task.Warn("Error creating request:", err)
 
@@ -141,6 +180,7 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := e.Client.Do(req)
 	if err != nil {
+		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
 		log.Task.Warn("Error sending request:", err)
 
 		return
@@ -150,14 +190,36 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
 		log.Task.Warn("Error reading response body:", err)
+
+		return
+	}
+
+	// 端点返回非 2xx（如 Cloudflare 521/502 这类源站不可用）或响应不是 JSON 对象（节点返回 HTML 错误页），都冷却端点，避免下轮再被命中
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
+		log.Task.Warn(fmt.Sprintf("EVM 数据解析错误(%s): endpoint=%s status=%d body=%s", e.Network, endpoint, resp.StatusCode, string(body)))
 
 		return
 	}
 
 	var res = gjson.ParseBytes(body)
 	if !res.IsObject() {
-		log.Task.Warn(fmt.Sprintf("EVM 数据解析错误(%s): %s", e.Network, string(body)))
+		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
+		log.Task.Warn(fmt.Sprintf("EVM 数据解析错误(%s): endpoint=%s body=%s", e.Network, endpoint, string(body)))
+
+		return
+	}
+
+	if res.Get("error").Exists() {
+		errStr := res.Get("error").String()
+		if isBadChainErr(errStr) {
+			conf.MarkEndpointBad(endpoint, evmEndpointBadCfgCD)
+		} else {
+			conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
+		}
+		log.Task.Warn(fmt.Sprintf("%s eth_blockNumber response error endpoint=%s err=%s", e.Network, endpoint, errStr))
 
 		return
 	}
@@ -344,6 +406,14 @@ func (e *evm) getBlockByNumber(a any) {
 				return
 			}
 
+			if isBadChainErr(errStr) {
+				conf.MarkEndpointBad(endpoint, evmEndpointBadCfgCD)
+				e.requeue(b)
+				log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber bad endpoint, endpoint=%s err=%s", e.Network, endpoint, errStr))
+
+				return
+			}
+
 			e.requeue(b)
 			log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber response error %s", e.Network, errStr))
 
@@ -372,8 +442,18 @@ func (e *evm) getBlockByNumber(a any) {
 			return
 		}
 
+		if errors.Is(err, errBadEndpoint) {
+			conf.MarkEndpointBad(endpoint, evmEndpointBadCfgCD)
+			e.requeue(b)
+			log.Task.Warn(fmt.Sprintf("%s eth_getLogs bad endpoint, endpoint=%s err=%s", e.Network, endpoint, err))
+
+			return
+		}
+
+		// 兜底：parseEventTransfer 的其他错误基本都是网络层（Do/ReadAll 超时或断开），冷却端点避免下一轮被同一个端点拖累
+		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
 		e.requeue(b)
-		log.Task.Warn("Evm Block Parse Error parsing block transfer:", err)
+		log.Task.Warn(fmt.Sprintf("Evm Block Parse Error parsing block transfer endpoint=%s err=%s", endpoint, err))
 
 		return
 	}
@@ -450,7 +530,17 @@ func (e *evm) parseNativeTransfer(array []gjson.Result, num int, timestamp time.
 
 func (e *evm) parseEventTransfer(ctx context.Context, endpoint string, b evmBlock, timestamp map[string]time.Time) ([]transfer, error) {
 	transfers := make([]transfer, 0)
-	post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x","topics":["%s"]}],"id":1}`, b.From, b.To, evmTransferEvent))
+	// 拼接 address 过滤；部分公共节点（如 allnodes.com）要求 eth_getLogs 必须带 address，否则会返回 -32701；
+	// 当前链没有合约（纯 native 链）则不带，保持兼容
+	addrFilter := ""
+	if contracts := model.GetNetworkContracts(model.Network(e.Network)); len(contracts) > 0 {
+		quoted := make([]string, 0, len(contracts))
+		for _, c := range contracts {
+			quoted = append(quoted, fmt.Sprintf("%q", c))
+		}
+		addrFilter = fmt.Sprintf(`,"address":[%s]`, strings.Join(quoted, ","))
+	}
+	post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x"%s,"topics":["%s"]}],"id":1}`, b.From, b.To, addrFilter, evmTransferEvent))
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(post))
 	if err != nil {
 
@@ -483,6 +573,11 @@ func (e *evm) parseEventTransfer(ctx context.Context, endpoint string, b evmBloc
 		if isRateLimitErr(0, errStr) {
 
 			return transfers, errors.Join(errRateLimited, fmt.Errorf("%s eth_getLogs response error %s", e.Network, errStr))
+		}
+
+		if isBadChainErr(errStr) {
+
+			return transfers, errors.Join(errBadEndpoint, fmt.Errorf("%s eth_getLogs response error %s", e.Network, errStr))
 		}
 
 		return transfers, fmt.Errorf("%s eth_getLogs response error %s", e.Network, errStr)
