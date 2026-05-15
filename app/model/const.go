@@ -71,8 +71,10 @@ const (
 	NotifyMaxRetry       ConfKey = "notify_max_retry"        // 最大重试次数，订单回调失败
 	BlockHeightMaxDiff   ConfKey = "block_height_max_diff"   // 区块高度最大差值，超过此值则以当前区块高度为准，重新开始扫描
 	BlockOffsetConfirm   ConfKey = "block_offset_confirm"    // 区块偏移确认数，扫描时以当前区块高度减去此偏移量为准，避免重链导致的订单回调失败
-	EvmBlockParseMaxNumBsc  ConfKey = "evm_block_parse_max_num_bsc"  // BSC 单次扫块的最大区块数量；公共节点限流时可调小（如 5）
+	EvmBlockParseMaxNumBsc  ConfKey = "evm_block_parse_max_num_bsc"  // BSC 单次 eth_getBlockByNumber 数组的区块数量；默认 5，自建/付费节点稳定时可调大提高吞吐
 	EvmBlockDispatchPoolBsc ConfKey = "evm_block_dispatch_pool_bsc" // BSC 区块消费 worker 数量；公共节点限流时可调小（如 1）
+	EvmBlockRollOffsetBsc   ConfKey = "evm_block_roll_offset_bsc"   // BSC 扫块滞后链头的区块数；公共节点对最新区块有延迟可调大，默认 5
+	EvmBlockLogsMaxNumBsc   ConfKey = "evm_block_logs_max_num_bsc"  // BSC 单次 eth_getLogs 调用覆盖的区块数；默认 50，公共节点上限 5000，调大可显著减少请求次数
 
 	MqttHost        ConfKey = "mqtt_host"
 	MqttPort        ConfKey = "mqtt_port"

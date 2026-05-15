@@ -31,6 +31,7 @@ const (
 	evmEndpointBadCfgCD  = 10 * time.Minute // 配置不匹配类错误（如 chain id 不对、方法不支持）的端点冷却时长，长时间踢出轮询
 	evmBlockMaxAttempts  = 5                // 单个区块范围最大重试次数，超过则丢弃，避免坏 range 无限循环把成功率指标拖花
 	evmRpcTimeout        = 20 * time.Second // 单次扫块 RPC 总超时；BSC 公共节点 Parse=true 时 3-8s 常态，留出足够余量
+	evmConfirmConcurrent = 5                // 单链 tradeConfirmHandle 并发上限；防止 N 个 Confirming 订单瞬间起 N 个 goroutine 把 RPC 端点打到限流
 )
 
 // errRateLimited 标识 RPC 限流类错误（-32005 / "limit exceeded" / HTTP 429 等），上层据此做端点冷却 + 区间二分
@@ -118,10 +119,12 @@ type evm struct {
 	Block           block
 	Native          evmNative
 	Client          *http.Client
-	AvgBlockTime    int64          // 平均出块时间，单位秒；一个大概值，用于计算首次启动时需要回溯的区块数量，尽量准确设置，默认1秒一个区块
-	BatchSizeKey    model.ConfKey  // 可选：覆盖 blockParseMaxNum 的配置键；为空时使用硬编码默认值
-	DispatchPoolKey model.ConfKey  // 可选：覆盖 blockDispatchPoolNum 的配置键；为空时使用硬编码默认值
-	blockScanQueue  *chanx.UnboundedChan[evmBlock]
+	AvgBlockTime       int64          // 平均出块时间，单位秒；一个大概值，用于计算首次启动时需要回溯的区块数量，尽量准确设置，默认1秒一个区块
+	BatchSizeKey       model.ConfKey  // 可选：覆盖 blockParseMaxNum 的配置键；为空时使用硬编码默认值
+	DispatchPoolKey    model.ConfKey  // 可选：覆盖 blockDispatchPoolNum 的配置键；为空时使用硬编码默认值
+	RollDelayOffsetKey model.ConfKey  // 可选：覆盖 Block.RollDelayOffset 的配置键；为空时使用结构体硬编码值
+	LogsBatchSizeKey   model.ConfKey  // 可选：覆盖 eth_getLogs 单次覆盖区块数；为空时回退 batchSize()，与 getBlock 同批
+	blockScanQueue     *chanx.UnboundedChan[evmBlock]
 }
 
 // batchSize 返回当前链每次扫块覆盖的最大区块数量；优先读 BatchSizeKey，未设置或非正数时回退默认
@@ -142,6 +145,30 @@ func (e *evm) dispatchPool() int {
 		}
 	}
 	return blockDispatchPoolNum
+}
+
+// rollDelayOffset 返回扫块滞后链头的区块数；优先读 RollDelayOffsetKey（允许 0），未配置时回退结构体硬编码值
+func (e *evm) rollDelayOffset() int64 {
+	if e.RollDelayOffsetKey != "" {
+		if raw := model.GetC(e.RollDelayOffsetKey); raw != "" {
+			if v := cast.ToInt64(raw); v >= 0 {
+				return v
+			}
+		}
+	}
+	return e.Block.RollDelayOffset
+}
+
+// logsBatchSize 返回 eth_getLogs 单次覆盖的区块数；优先读 LogsBatchSizeKey，未设置或非正数时回退到 batchSize()，
+// 与历史 getBlock/getLogs 同批的语义保持一致。logs 一般限制远比 getBlock 宽松（BSC 节点上限 5000），
+// 调大可以显著减少请求次数；getBlock 仍按 batchSize() 分小批，避免单次响应体过大踩超时
+func (e *evm) logsBatchSize() int64 {
+	if e.LogsBatchSizeKey != "" {
+		if v := cast.ToInt64(model.GetC(e.LogsBatchSizeKey)); v > 0 {
+			return v
+		}
+	}
+	return e.batchSize()
 }
 
 type evmBlock struct {
@@ -224,7 +251,7 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 		return
 	}
 
-	var now = utils.HexStr2Int(res.Get("result").String()).Int64() - e.Block.RollDelayOffset
+	var now = utils.HexStr2Int(res.Get("result").String()).Int64() - e.rollDelayOffset()
 	if now <= 0 {
 
 		return
@@ -235,7 +262,7 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 
 		lastBlockNumber = v.(int64)
 	} else {
-		e.syncBlocksBackward(now) // 不存在，说明是第一次启动
+		e.syncBlocksBackward(ctx, now) // 不存在，说明是第一次启动
 	}
 
 	if now-lastBlockNumber > cast.ToInt64(model.GetC(model.BlockHeightMaxDiff)) {
@@ -249,7 +276,7 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 		return
 	}
 
-	step := e.batchSize()
+	step := e.logsBatchSize()
 	for from := lastBlockNumber + 1; from <= now; from += step {
 		to := from + step - 1
 		if to > now {
@@ -260,7 +287,7 @@ func (e *evm) syncBlocksForward(ctx context.Context) {
 	}
 }
 
-func (e *evm) syncBlocksBackward(now int64) {
+func (e *evm) syncBlocksBackward(ctx context.Context, now int64) {
 	if e.AvgBlockTime <= 0 { // 未设置平均出块时间，默认1秒一个
 		e.AvgBlockTime = 1
 	}
@@ -280,7 +307,7 @@ func (e *evm) syncBlocksBackward(now int64) {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 
-		step := e.batchSize()
+		step := e.logsBatchSize()
 		for from := start; from <= now; from += step {
 			if syncBreak(e.Network, e.blockScanQueue.Len()) {
 
@@ -292,9 +319,18 @@ func (e *evm) syncBlocksBackward(now int64) {
 				to = now
 			}
 
-			e.blockScanQueue.In <- evmBlock{From: from, To: to}
+			// 入队和等待 ticker 都监听 ctx.Done，确保进程关闭时能及时退出，避免 goroutine 泄漏
+			select {
+			case <-ctx.Done():
+				return
+			case e.blockScanQueue.In <- evmBlock{From: from, To: to}:
+			}
 
-			<-ticker.C
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
 	}()
 }
@@ -348,91 +384,54 @@ func (e *evm) getBlockByNumber(a any) {
 		return
 	}
 
-	items := make([]string, 0)
-	for i := b.From; i <= b.To; i++ {
-		items = append(items, fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x%x",%t],"id":%d}`, i, e.Native.Parse, i))
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), evmRpcTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer([]byte(fmt.Sprintf(`[%s]`, strings.Join(items, ",")))))
-	if err != nil {
-		log.Task.Warn("Error creating request:", err)
-
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := e.Client.Do(req)
-	if err != nil {
-		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
-		e.requeue(b)
-		log.Task.Warn("eth_getBlockByNumber Error sending request:", err)
-
-		return
-	}
-
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
-		e.requeue(b)
-		log.Task.Warn("eth_getBlockByNumber Error reading response body:", err)
-
-		return
-	}
-
-	if isRateLimitErr(resp.StatusCode, string(body)) {
-		conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
-		e.requeueOnRateLimit(b)
-		log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber rate limited, endpoint=%s status=%d", e.Network, endpoint, resp.StatusCode))
-
-		return
-	}
-
+	// Phase 1：按 batchSize() 拆成小批拉 eth_getBlockByNumber，避免 Parse=true 时单次响应体过大踩 20s 超时；
+	// 每个子批独立 ctx，避免 N 批共享 20s 预算把后半挤爆；失败时整段 requeue，重复拉取已成功的子块作为代价换实现简单
 	nativeTransfers := make([]transfer, 0)
 	blockTimestamp := make(map[string]time.Time)
-	for _, itm := range gjson.ParseBytes(body).Array() {
-		if itm.Get("error").Exists() {
-			errStr := itm.Get("error").String()
+	blockChunk := e.batchSize()
+	for cur := b.From; cur <= b.To; cur += blockChunk {
+		end := cur + blockChunk - 1
+		if end > b.To {
+			end = b.To
+		}
 
-			if isRateLimitErr(0, errStr) {
+		chunkCtx, chunkCancel := context.WithTimeout(context.Background(), evmRpcTimeout)
+		nt, bt, err := e.fetchBlockChunk(chunkCtx, endpoint, cur, end)
+		chunkCancel()
+		if err != nil {
+			if errors.Is(err, errRateLimited) {
 				conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
 				e.requeueOnRateLimit(b)
-				log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber rate limited, endpoint=%s err=%s", e.Network, endpoint, errStr))
+				log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber rate limited, endpoint=%s err=%s", e.Network, endpoint, err))
 
 				return
 			}
 
-			if isBadChainErr(errStr) {
+			if errors.Is(err, errBadEndpoint) {
 				conf.MarkEndpointBad(endpoint, evmEndpointBadCfgCD)
 				e.requeue(b)
-				log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber bad endpoint, endpoint=%s err=%s", e.Network, endpoint, errStr))
+				log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber bad endpoint, endpoint=%s err=%s", e.Network, endpoint, err))
 
 				return
 			}
 
+			conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
 			e.requeue(b)
-			log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber response error %s", e.Network, errStr))
+			log.Task.Warn(fmt.Sprintf("%s eth_getBlockByNumber Error endpoint=%s err=%s", e.Network, endpoint, err))
 
 			return
 		}
 
-		timestamp := utils.HexStr2Int(itm.Get("result.timestamp").String()).Int64()
-		blockTime := time.Unix(timestamp, 0)
-		blockNumHex := itm.Get("result.number").String()
-		blockTimestamp[blockNumHex] = blockTime
-
-		var array = itm.Get("result.transactions").Array()
-		if e.Native.Parse && len(array) != 0 {
-
-			nativeTransfers = append(nativeTransfers, e.parseNativeTransfer(array, int(utils.HexStr2Int(blockNumHex).Int64()), blockTime)...)
+		nativeTransfers = append(nativeTransfers, nt...)
+		for k, v := range bt {
+			blockTimestamp[k] = v
 		}
 	}
 
-	transfers, err := e.parseEventTransfer(ctx, endpoint, b, blockTimestamp)
+	// Phase 2：单次 eth_getLogs 覆盖整个 [b.From, b.To]；公共节点 logs 上限通常 5000，比 getBlock 宽松得多
+	logsCtx, logsCancel := context.WithTimeout(context.Background(), evmRpcTimeout)
+	defer logsCancel()
+	transfers, err := e.parseEventTransfer(logsCtx, endpoint, b, blockTimestamp)
 	if err != nil {
 		if errors.Is(err, errRateLimited) {
 			conf.MarkEndpointBad(endpoint, evmEndpointCooldown)
@@ -483,6 +482,71 @@ func (e *evm) requeueOnRateLimit(b evmBlock) {
 	mid := b.From + (b.To-b.From)/2
 	e.requeue(evmBlock{From: b.From, To: mid, Attempts: b.Attempts})
 	e.requeue(evmBlock{From: mid + 1, To: b.To, Attempts: b.Attempts})
+}
+
+// fetchBlockChunk 取 [from, to] 区间的区块体（含 native 转账与 block timestamp），错误归类为
+// errRateLimited / errBadEndpoint / 通用错误，由调用方做端点冷却与 requeue
+func (e *evm) fetchBlockChunk(ctx context.Context, endpoint string, from, to int64) ([]transfer, map[string]time.Time, error) {
+	items := make([]string, 0, to-from+1)
+	for i := from; i <= to; i++ {
+		items = append(items, fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x%x",%t],"id":%d}`, i, e.Native.Parse, i))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer([]byte(fmt.Sprintf(`[%s]`, strings.Join(items, ",")))))
+	if err != nil {
+
+		return nil, nil, errors.Join(errors.New("eth_getBlockByNumber NewRequest Error"), err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := e.Client.Do(req)
+	if err != nil {
+
+		return nil, nil, errors.Join(errors.New("eth_getBlockByNumber Do Error"), err)
+	}
+
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+
+		return nil, nil, errors.Join(errors.New("eth_getBlockByNumber ReadAll Error"), err)
+	}
+
+	if isRateLimitErr(resp.StatusCode, string(body)) {
+
+		return nil, nil, errors.Join(errRateLimited, fmt.Errorf("status=%d body=%s", resp.StatusCode, string(body)))
+	}
+
+	nativeTransfers := make([]transfer, 0)
+	blockTimestamp := make(map[string]time.Time)
+	for _, itm := range gjson.ParseBytes(body).Array() {
+		if itm.Get("error").Exists() {
+			errStr := itm.Get("error").String()
+			if isRateLimitErr(0, errStr) {
+
+				return nil, nil, errors.Join(errRateLimited, fmt.Errorf("eth_getBlockByNumber response error %s", errStr))
+			}
+			if isBadChainErr(errStr) {
+
+				return nil, nil, errors.Join(errBadEndpoint, fmt.Errorf("eth_getBlockByNumber response error %s", errStr))
+			}
+
+			return nil, nil, fmt.Errorf("eth_getBlockByNumber response error %s", errStr)
+		}
+
+		timestamp := utils.HexStr2Int(itm.Get("result.timestamp").String()).Int64()
+		blockTime := time.Unix(timestamp, 0)
+		blockNumHex := itm.Get("result.number").String()
+		blockTimestamp[blockNumHex] = blockTime
+
+		if array := itm.Get("result.transactions").Array(); e.Native.Parse && len(array) != 0 {
+
+			nativeTransfers = append(nativeTransfers, e.parseNativeTransfer(array, int(utils.HexStr2Int(blockNumHex).Int64()), blockTime)...)
+		}
+	}
+
+	return nativeTransfers, blockTimestamp, nil
 }
 
 func (e *evm) parseNativeTransfer(array []gjson.Result, num int, timestamp time.Time) []transfer {
@@ -677,12 +741,15 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 		}
 	}
 
+	sem := make(chan struct{}, evmConfirmConcurrent)
 	for _, order := range orders {
 		wg.Add(1)
-		go func() {
+		sem <- struct{}{}
+		go func(o model.Order) {
 			defer wg.Done()
-			handle(order)
-		}()
+			defer func() { <-sem }()
+			handle(o)
+		}(order)
 	}
 
 	wg.Wait()

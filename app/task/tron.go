@@ -63,7 +63,7 @@ func newTron() tron {
 }
 
 // syncBlocksForward 正向同步区块
-func (t *tron) syncBlocksForward(context.Context) {
+func (t *tron) syncBlocksForward(ctx context.Context) {
 	if t.syncBreak() {
 
 		return
@@ -76,8 +76,8 @@ func (t *tron) syncBlocksForward(context.Context) {
 		return
 	}
 
-	var ctx, cancel = context.WithTimeout(context.Background(), time.Second*15)
-	block, err1 := api.NewWalletClient(conn).GetNowBlock2(ctx, nil)
+	rpcCtx, cancel := context.WithTimeout(ctx, time.Second*15)
+	block, err1 := api.NewWalletClient(conn).GetNowBlock2(rpcCtx, nil)
 	defer cancel()
 
 	if err1 != nil {
@@ -90,7 +90,7 @@ func (t *tron) syncBlocksForward(context.Context) {
 
 	// 区块高度变化过大，强制丢块重扫
 	if now-t.lastBlockNum > cast.ToInt(model.GetC(model.BlockHeightMaxDiff)) {
-		t.syncBlocksBackward(now)
+		t.syncBlocksBackward(ctx, now)
 		t.lastBlockNum = now - 1
 	}
 
@@ -110,7 +110,7 @@ func (t *tron) syncBlocksForward(context.Context) {
 }
 
 // syncBlocksBackward 反向同步区块，针对程序启动前就已经存在待支付订单时，补齐之前的区块数据，自适应偏移数量
-func (t *tron) syncBlocksBackward(now int) {
+func (t *tron) syncBlocksBackward(ctx context.Context, now int) {
 	var o model.Order
 	trade := model.GetNetworkTrades(conf.Tron)
 	model.Db.Model(&model.Order{}).Where("status = ? and trade_type in (?)", model.OrderStatusWaiting, trade).Order("created_at asc").Limit(1).Find(&o)
@@ -134,11 +134,19 @@ func (t *tron) syncBlocksBackward(now int) {
 			}
 
 			for i := 0; i < 10 && b >= start; i++ {
-				t.blockScanQueue.In <- b
+				select {
+				case <-ctx.Done():
+					return
+				case t.blockScanQueue.In <- b:
+				}
 				b--
 			}
 
-			<-ticker.C
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
 	}()
 }
@@ -207,11 +215,16 @@ func (t *tron) blockParse(n any) {
 		var itm = trans.GetTransaction()
 		var id = hex.EncodeToString(trans.Txid)
 		for _, contract := range itm.GetRawData().GetContract() {
-			// 资源代理 DelegateResourceContract
+			// 资源代理 DelegateResourceContract（仅 ENERGY 走入队列，BANDWIDTH 直接丢弃，下游也只关心 ENERGY）
 			if contract.GetType() == core.Transaction_Contract_DelegateResourceContract {
 				var foo = &core.DelegateResourceContract{}
 				err := contract.GetParameter().UnmarshalTo(foo)
 				if err != nil {
+
+					continue
+				}
+
+				if foo.Resource != core.ResourceCode_ENERGY {
 
 					continue
 				}
@@ -227,11 +240,16 @@ func (t *tron) blockParse(n any) {
 				})
 			}
 
-			// 资源回收 UnDelegateResourceContract
+			// 资源回收 UnDelegateResourceContract（同上，仅保留 ENERGY）
 			if contract.GetType() == core.Transaction_Contract_UnDelegateResourceContract {
 				var foo = &core.UnDelegateResourceContract{}
 				err := contract.GetParameter().UnmarshalTo(foo)
 				if err != nil {
+
+					continue
+				}
+
+				if foo.Resource != core.ResourceCode_ENERGY {
 
 					continue
 				}
@@ -460,13 +478,16 @@ func (t *tron) tradeConfirmHandle(ctx context.Context) {
 		}
 	}
 
+	sem := make(chan struct{}, evmConfirmConcurrent)
 	for _, order := range orders {
 		wg.Add(1)
-		go func() {
+		sem <- struct{}{}
+		go func(o model.Order) {
 			defer wg.Done()
+			defer func() { <-sem }()
 
-			handle(order)
-		}()
+			handle(o)
+		}(order)
 	}
 
 	wg.Wait()
@@ -518,6 +539,14 @@ func (t *tron) scheduleBlockRetry(num int, delay time.Duration) {
 	}
 
 	attempt := t.retryAttempts[num] + 1
+	if attempt > tronMaxRetryAttempts {
+		// 达上限直接放弃，清理计数避免 map 长期累积无主键泄漏
+		delete(t.retryAttempts, num)
+		t.retryMu.Unlock()
+		log.Task.Warn(fmt.Sprintf("Tron 区块 %d 已重试 %d 次仍失败，放弃", num, tronMaxRetryAttempts))
+
+		return
+	}
 	t.retryAttempts[num] = attempt
 
 	if delay <= 0 {
@@ -558,6 +587,8 @@ func (t *tron) resetBlockRetry(num int) {
 		delete(t.retryScheduled, num)
 	}
 }
+
+const tronMaxRetryAttempts = 10 // 单块最大重试次数；超过则放弃，避免 retryAttempts map 因永远失败的块单调累积
 
 func tronRetryDelay(attempt int) time.Duration {
 	if attempt < 1 {

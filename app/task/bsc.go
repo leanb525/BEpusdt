@@ -22,10 +22,12 @@ func bscInit() {
 			Decimal:   conf.BscBnbDecimals,
 			TradeType: model.BscBnb,
 		},
-		Client:          utils.NewHttpClient(),
-		BatchSizeKey:    model.EvmBlockParseMaxNumBsc,
-		DispatchPoolKey: model.EvmBlockDispatchPoolBsc,
-		blockScanQueue:  chanx.NewUnboundedChan[evmBlock](ctx, 30),
+		Client:             utils.NewHttpClient(),
+		BatchSizeKey:       model.EvmBlockParseMaxNumBsc,
+		DispatchPoolKey:    model.EvmBlockDispatchPoolBsc,
+		RollDelayOffsetKey: model.EvmBlockRollOffsetBsc,
+		LogsBatchSizeKey:   model.EvmBlockLogsMaxNumBsc,
+		blockScanQueue:     chanx.NewUnboundedChan[evmBlock](ctx, 30),
 	}
 
 	Register(Task{Callback: bsc.blockDispatch})

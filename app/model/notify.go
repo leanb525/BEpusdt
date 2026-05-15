@@ -11,20 +11,19 @@ func (nr NotifyRecord) TableName() string {
 	return "bep_notify"
 }
 
+// IsNeedNotifyByTxid 判断指定 txid 是否需要触发通知；
+// 原实现为两次独立 SELECT（且 Find 会把整行加载），改成单次 UNION ALL 子查询只算行数，
+// 一次 DB roundtrip 覆盖 bep_notify 和 bep_order 两表的存在性检测
 func IsNeedNotifyByTxid(txid string) bool {
-	var record NotifyRecord
-	var res = Db.Where("txid = ?", txid).Limit(1).Find(&record)
-	if res.RowsAffected > 0 {
+	var count int64
+	Db.Raw(
+		"SELECT COUNT(*) FROM ("+
+			"SELECT 1 AS x FROM bep_notify WHERE txid = ? "+
+			"UNION ALL "+
+			"SELECT 1 AS x FROM bep_order WHERE ref_hash = ?"+
+			") AS t",
+		txid, txid,
+	).Scan(&count)
 
-		return false
-	}
-
-	var order Order
-	var res2 = Db.Where("ref_hash = ?", txid).Limit(1).Find(&order)
-	if res2.RowsAffected > 0 {
-
-		return false
-	}
-
-	return true
+	return count == 0
 }

@@ -167,6 +167,16 @@ func Bepusdt(o model.Order) {
 		return
 	}
 
+	// 外层先 cache check + Set 提前占位，避免 notifyRoll 每 30s 对 N 个 waiting 订单
+	// 起 N 个 goroutine 然后 999 个进去再走 cache 命中直接退出的浪费；
+	// 同时关闭 TOCTOU 窗口：两次 roll 之间如果 deliver 还没跑到 cache.Set，新 roll 会再 spawn 一个
+	key := fmt.Sprintf("bepusdt_notify_%d_%s", o.Status, o.TradeId)
+	if _, ok := cache.Get(key); ok {
+
+		return
+	}
+	cache.Set(key, true, time.Minute)
+
 	var authToken = model.AuthToken()
 	var client = &http.Client{Timeout: time.Second * 5}
 	go func() {

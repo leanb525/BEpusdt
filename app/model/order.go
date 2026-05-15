@@ -119,10 +119,26 @@ func (o *Order) MarkConfirming(blockNum int, from, hash string, at time.Time, am
 }
 
 func (o *Order) SetNotifyState(state int) error {
+	// ABA 防护：用 WHERE notify_num = ? 防止两个并发 retry 都把计数从 N 写成 N+1 导致丢失；
+	// 仅更新 notify_num + notify_state 两列，避免全字段 Save 把过期的内存值覆盖落盘
+	res := Db.Model(&Order{}).
+		Where("id = ? and notify_num = ?", o.ID, o.NotifyNum).
+		Updates(map[string]any{
+			"notify_num":   o.NotifyNum + 1,
+			"notify_state": state,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		// 命中并发：另一个 goroutine 已经把 notify_num 写过了，本次跳过
+		return errors.New("notify state conflict, another retry is in progress")
+	}
+
 	o.NotifyNum += 1
 	o.NotifyState = state
 
-	return Db.Save(o).Error
+	return nil
 }
 
 func (o *Order) GetStatusLabel() string {
@@ -198,12 +214,18 @@ func CalcTradeAmount(address []string, rate decimal.Decimal, p OrderParams) (str
 		return LockTradeAddress(address, p.TradeType)
 	}
 
-	var orders []Order
+	// 只 Select 两列，避免把 Order 全字段（含 notify_url/return_url 等 varchar(255)）都加载到内存；
+	// 高并发下单时这里被频繁触发，列裁剪能显著降 IO 与内存分配
+	var rows []struct {
+		Address string
+		Amount  string
+	}
 	lock := make(map[string]bool)
 	status := []int{OrderStatusConfirming, OrderStatusWaiting}
-	Db.Where("status in (?) and trade_type = ?", status, p.TradeType).Find(&orders)
-	for _, order := range orders {
-		lock[order.Address+order.Amount] = true
+	Db.Model(&Order{}).Select("address", "amount").
+		Where("status in (?) and trade_type = ?", status, p.TradeType).Find(&rows)
+	for _, r := range rows {
+		lock[r.Address+r.Amount] = true
 	}
 
 	atom, precision := GetAtomicity(p.TradeType)
@@ -237,13 +259,25 @@ func CalcTradeAmount(address []string, rate decimal.Decimal, p OrderParams) (str
 }
 
 // LockTradeAddress 检测交易地址，独占使用
+// 原实现为每个 address 一次 SELECT 的 N+1 查询；改为一次 IN 查询拿出全部已占用的地址，
+// 内存里做差集判定，N 个地址 → 1 次 DB
 func LockTradeAddress(address []string, t TradeType) (string, string, error) {
 	zero := decimal.Zero.String()
 	status := []int{OrderStatusConfirming, OrderStatusWaiting}
+
+	var taken []string
+	Db.Model(&Order{}).
+		Where("address in (?) and status in (?) and trade_type = ? and address_locked = ?", address, status, t, true).
+		Distinct().Pluck("address", &taken)
+
+	takenSet := make(map[string]struct{}, len(taken))
+	for _, a := range taken {
+		takenSet[a] = struct{}{}
+	}
+
 	for _, addr := range address {
-		var o Order
-		Db.Where("address = ? and status in (?) and trade_type = ? and address_locked = ?", addr, status, t, true).Order("id desc").Limit(1).Find(&o)
-		if o.ID == 0 {
+		if _, ok := takenSet[addr]; !ok {
+
 			return addr, zero, nil
 		}
 	}
@@ -257,7 +291,7 @@ func CalcTradeExpiredAt(sec int64) time.Time {
 		return time.Now().Add(time.Duration(sec) * time.Second)
 	}
 
-	return time.Now().Add(time.Duration(cast.ToUint64(GetK(PaymentTimeout))) * time.Second)
+	return time.Now().Add(time.Duration(cast.ToUint64(GetC(PaymentTimeout))) * time.Second)
 }
 
 func GetAtomicity(t TradeType) (decimal.Decimal, int32) {
@@ -266,7 +300,7 @@ func GetAtomicity(t TradeType) (decimal.Decimal, int32) {
 		confKey = "atom_usdt"
 	}
 
-	atom, _ := decimal.NewFromString(GetK(confKey))
+	atom, _ := decimal.NewFromString(GetC(confKey))
 
 	return atom, cast.ToInt32(math.Abs(float64(atom.Exponent())))
 }

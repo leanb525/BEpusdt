@@ -39,8 +39,10 @@ var defaultConf = map[ConfKey]string{
 	NotifyMaxRetry:          "10",
 	BlockHeightMaxDiff:      "1000",
 	BlockOffsetConfirm:      "0",
-	EvmBlockParseMaxNumBsc:  "10",
+	EvmBlockParseMaxNumBsc:  "5",
 	EvmBlockDispatchPoolBsc: "3",
+	EvmBlockRollOffsetBsc:   "5",
+	EvmBlockLogsMaxNumBsc:   "50",
 	PaymentTimeout:          "1200", // 20分钟
 	PaymentMatchMode:        string(Classic),
 	SystemInstallLock:       "0",
@@ -130,7 +132,7 @@ func RefreshC() {
 }
 
 func CheckoutCounter(host, id string) string {
-	uri := GetK(ApiAppUri)
+	uri := GetC(ApiAppUri)
 	if uri == "" {
 		uri = host
 	}
@@ -139,7 +141,7 @@ func CheckoutCounter(host, id string) string {
 }
 
 func CheckoutCashier(host, id string) string {
-	uri := GetK(ApiAppUri)
+	uri := GetC(ApiAppUri)
 	if uri == "" {
 		uri = host
 	}
@@ -208,7 +210,7 @@ func ConfInit() {
 
 func AuthToken() string {
 
-	return GetK(ApiAuthToken)
+	return GetC(ApiAuthToken)
 }
 
 func IsInstalled() bool {

@@ -513,7 +513,7 @@ func GetPaymentItem(crypto model.Crypto, order model.Order) []PaymentItem {
 		}
 
 		// 获取汇率配置的浮动语法
-		syntax := model.GetK(model.ConfKey(fmt.Sprintf("rate_float_%s_%s", conf.Crypto, fiat)))
+		syntax := model.GetC(model.ConfKey(fmt.Sprintf("rate_float_%s_%s", conf.Crypto, fiat)))
 
 		// 获取汇率
 		rate, err := model.GetOrderRate(conf.Crypto, fiat, syntax)

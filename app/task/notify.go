@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/v03413/bepusdt/app/log"
@@ -9,7 +10,10 @@ import (
 	"github.com/v03413/bepusdt/app/notifier"
 	"github.com/v03413/bepusdt/app/task/notify"
 	"github.com/v03413/bepusdt/app/utils"
+	"github.com/v03413/go-cache"
 )
+
+const notifyRetryInflightTTL = 15 * time.Second // 单订单 retry 进行中标记 TTL；防止 3s ticker 多次 spawn 同一订单 goroutine 引发 race
 
 func init() {
 	Register(Task{Duration: time.Second * 3, Callback: notifyRetry})
@@ -27,9 +31,21 @@ func notifyRetry(context.Context) {
 
 	for _, order := range tradeOrders {
 		next := utils.CalcNextNotifyTime(*order.ConfirmedAt, order.NotifyNum)
-		if time.Now().Unix() >= next.Unix() {
-			go notify.Handle(order)
+		if time.Now().Unix() < next.Unix() {
+			continue
 		}
+
+		// in-flight 标记防 ticker 重叠时重复 spawn；HTTP 超时 10s，TTL 15s 留余量
+		key := fmt.Sprintf("notify_retry_inflight_%s", order.TradeId)
+		if _, ok := cache.Get(key); ok {
+			continue
+		}
+		cache.Set(key, true, notifyRetryInflightTTL)
+
+		go func(o model.Order) {
+			defer cache.Delete(key)
+			_ = notify.Handle(o)
+		}(order)
 	}
 }
 

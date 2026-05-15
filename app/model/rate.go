@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -21,19 +22,30 @@ import (
 type Rate struct {
 	Id
 	Rate    string  `gorm:"column:rate;type:varchar(32);not null;comment:订单汇率" json:"rate"`
-	Fiat    string  `gorm:"column:fiat;type:varchar(16);not null;comment:法币" json:"fiat"`
-	Crypto  string  `gorm:"column:crypto;type:varchar(16);not null;comment:加密货币" json:"crypto"`
+	Fiat    string  `gorm:"column:fiat;type:varchar(16);not null;index:idx_rate_lookup,priority:2;comment:法币" json:"fiat"`
+	Crypto  string  `gorm:"column:crypto;type:varchar(16);not null;index:idx_rate_lookup,priority:1;comment:加密货币" json:"crypto"`
 	RawRate float64 `gorm:"column:raw_rate;type:decimal(10,4);not null;comment:基准汇率" json:"raw_rate"`
 	Syntax  string  `gorm:"column:syntax;type:varchar(32);not null;default:'';comment:浮动语法" json:"syntax"`
 	AutoTimeAt
 }
+
+// rateCache 缓存按 (crypto, fiat) 维度的最新一行 Rate；汇率每小时同步一次，1 分钟内存缓存足够
+// GetPaymentItem 每打开收银台会循环 19 次 GetOrderRate，原本每次都要走 DB，现在命中缓存零 IO
+var rateCache sync.Map // key: string("crypto:fiat"), value: rateCacheEntry
+
+type rateCacheEntry struct {
+	rate Rate
+	at   time.Time
+}
+
+const rateCacheTTL = time.Minute
 
 func (r *Rate) TableName() string {
 	return "bep_rate"
 }
 
 func (r *Rate) BeforeCreate(*gorm.DB) error {
-	var syntax = GetK(ConfKey(fmt.Sprintf("rate_float_%s_%s", r.Crypto, r.Fiat)))
+	var syntax = GetC(ConfKey(fmt.Sprintf("rate_float_%s_%s", r.Crypto, r.Fiat)))
 	if syntax == "" {
 
 		return nil
@@ -117,6 +129,9 @@ func CoingeckoRate() error {
 
 	Db.Create(&rows)
 
+	// 写入后失效缓存，让下一次 GetOrderRate 读到最新值
+	InvalidateRateCache()
+
 	return nil
 }
 
@@ -171,12 +186,43 @@ func round(val float64, precision int) float64 {
 	return math.Floor(val*p+0.5) / p
 }
 
-func GetOrderRate(token Crypto, fiat Fiat, syntax string) (decimal.Decimal, error) {
+// getLatestRate 返回 (crypto, fiat) 最新一行 Rate；命中缓存零 IO，未命中走 DB 并填充
+func getLatestRate(token Crypto, fiat Fiat) (Rate, error) {
+	key := string(token) + ":" + string(fiat)
+	if v, ok := rateCache.Load(key); ok {
+		entry := v.(rateCacheEntry)
+		if time.Since(entry.at) < rateCacheTTL {
+
+			return entry.rate, nil
+		}
+	}
+
 	var r Rate
 	Db.Where("crypto = ? and fiat = ?", token, fiat).Order("created_at desc").Limit(1).Find(&r)
 	if r.ID == 0 {
 
-		return decimal.Decimal{}, fmt.Errorf("创建失败，请检查汇率同步是否正常：%s %s", token, fiat)
+		return r, fmt.Errorf("创建失败，请检查汇率同步是否正常：%s %s", token, fiat)
+	}
+
+	rateCache.Store(key, rateCacheEntry{rate: r, at: time.Now()})
+
+	return r, nil
+}
+
+// InvalidateRateCache 在 Rate 写入后调用，避免读到过期缓存；批量同步后调一次即可
+func InvalidateRateCache() {
+	rateCache.Range(func(k, _ any) bool {
+		rateCache.Delete(k)
+
+		return true
+	})
+}
+
+func GetOrderRate(token Crypto, fiat Fiat, syntax string) (decimal.Decimal, error) {
+	r, err := getLatestRate(token, fiat)
+	if err != nil {
+
+		return decimal.Decimal{}, err
 	}
 
 	if syntax == "" {

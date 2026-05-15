@@ -176,7 +176,7 @@
               </div>
 
               <a-row :gutter="[16, 6]">
-                <a-col :xs="24" :sm="24" :md="12">
+                <a-col :xs="24" :sm="12" :md="6">
                   <a-form-item
                     field="evm_block_parse_max_num_bsc"
                     :rules="[{ required: true, type: 'number', positive: true, message: '请输入正整数' }]"
@@ -185,9 +185,9 @@
                     <template #label>
                       <div class="tron-grid-label">
                         <span class="label-with-tip">
-                          <span>BSC 单次扫块区块数</span>
+                          <span>BSC getBlock 单批数</span>
                           <a-tooltip
-                            content="BSC 单次 eth_getLogs 调用覆盖的区块数量上限。公共节点频繁报 limit exceeded 时建议调小（如 5）；自建节点可加大提高吞吐。默认 10。"
+                            content="单次 eth_getBlockByNumber 数组的区块数量。BSC Parse=true 时响应体大、易超时，公共节点建议小（默认 5）；自建/付费节点稳定可调大提高吞吐。"
                             position="top"
                           >
                             <icon-question-circle class="tip-icon" />
@@ -197,14 +197,42 @@
                     </template>
                     <a-input
                       v-model="formData.evm_block_parse_max_num_bsc"
-                      placeholder="默认 10"
+                      placeholder="默认 5"
                       allow-clear
                       size="small"
                       class="network-input"
                     />
                   </a-form-item>
                 </a-col>
-                <a-col :xs="24" :sm="24" :md="12">
+                <a-col :xs="24" :sm="12" :md="6">
+                  <a-form-item
+                    field="evm_block_logs_max_num_bsc"
+                    :rules="[{ required: true, type: 'number', positive: true, message: '请输入正整数' }]"
+                    class="network-form-item"
+                  >
+                    <template #label>
+                      <div class="tron-grid-label">
+                        <span class="label-with-tip">
+                          <span>BSC getLogs 单次块数</span>
+                          <a-tooltip
+                            content="单次 eth_getLogs 调用覆盖的区块数。公共节点上限通常 5000，比 getBlock 宽松得多。调大可显著减少请求次数（默认 50）。过大可能在 USDT 等热门合约上响应体过大被节点拒绝。"
+                            position="top"
+                          >
+                            <icon-question-circle class="tip-icon" />
+                          </a-tooltip>
+                        </span>
+                      </div>
+                    </template>
+                    <a-input
+                      v-model="formData.evm_block_logs_max_num_bsc"
+                      placeholder="默认 50"
+                      allow-clear
+                      size="small"
+                      class="network-input"
+                    />
+                  </a-form-item>
+                </a-col>
+                <a-col :xs="24" :sm="12" :md="6">
                   <a-form-item
                     field="evm_block_dispatch_pool_bsc"
                     :rules="[{ required: true, type: 'number', positive: true, message: '请输入正整数' }]"
@@ -226,6 +254,37 @@
                     <a-input
                       v-model="formData.evm_block_dispatch_pool_bsc"
                       placeholder="默认 3"
+                      allow-clear
+                      size="small"
+                      class="network-input"
+                    />
+                  </a-form-item>
+                </a-col>
+                <a-col :xs="24" :sm="12" :md="6">
+                  <a-form-item
+                    field="evm_block_roll_offset_bsc"
+                    :rules="[
+                      { required: true, message: '请输入非负整数' },
+                      { match: /^\d+$/, message: '只能输入非负整数' }
+                    ]"
+                    class="network-form-item"
+                  >
+                    <template #label>
+                      <div class="tron-grid-label">
+                        <span class="label-with-tip">
+                          <span>BSC 扫块滞后块数</span>
+                          <a-tooltip
+                            content="每轮拉取最新区块高度后，再向后退几个块作为扫描终点。某些公共节点对最新区块有同步延迟，直接扫会报 block is out of range 或返回空，适当滞后可降低失败率。默认 5；自建节点稳定可设为 0。"
+                            position="top"
+                          >
+                            <icon-question-circle class="tip-icon" />
+                          </a-tooltip>
+                        </span>
+                      </div>
+                    </template>
+                    <a-input
+                      v-model="formData.evm_block_roll_offset_bsc"
+                      placeholder="默认 5"
                       allow-clear
                       size="small"
                       class="network-input"
@@ -313,7 +372,9 @@ const getConf = async () => {
       ...networks.map(network => network.key),
       "rpc_endpoint_tron_grid_api_key",
       "evm_block_parse_max_num_bsc",
-      "evm_block_dispatch_pool_bsc"
+      "evm_block_logs_max_num_bsc",
+      "evm_block_dispatch_pool_bsc",
+      "evm_block_roll_offset_bsc"
     ];
 
     const response = await getsConfAPI({ keys });
@@ -323,8 +384,10 @@ const getConf = async () => {
       formData[network.key] = data[network.key] || "";
     });
     formData.rpc_endpoint_tron_grid_api_key = data.rpc_endpoint_tron_grid_api_key || "";
-    formData.evm_block_parse_max_num_bsc = data.evm_block_parse_max_num_bsc || "10";
+    formData.evm_block_parse_max_num_bsc = data.evm_block_parse_max_num_bsc || "5";
+    formData.evm_block_logs_max_num_bsc = data.evm_block_logs_max_num_bsc || "50";
     formData.evm_block_dispatch_pool_bsc = data.evm_block_dispatch_pool_bsc || "3";
+    formData.evm_block_roll_offset_bsc = data.evm_block_roll_offset_bsc ?? "5";
 
     originalData.value = { ...formData };
   } catch (error) {
@@ -381,11 +444,19 @@ const handleSave = async () => {
     // BSC 扫块高级参数
     saveData.push({
       key: "evm_block_parse_max_num_bsc",
-      value: formData.evm_block_parse_max_num_bsc?.trim() || "10"
+      value: formData.evm_block_parse_max_num_bsc?.trim() || "5"
+    });
+    saveData.push({
+      key: "evm_block_logs_max_num_bsc",
+      value: formData.evm_block_logs_max_num_bsc?.trim() || "50"
     });
     saveData.push({
       key: "evm_block_dispatch_pool_bsc",
       value: formData.evm_block_dispatch_pool_bsc?.trim() || "3"
+    });
+    saveData.push({
+      key: "evm_block_roll_offset_bsc",
+      value: formData.evm_block_roll_offset_bsc?.trim() ?? "5"
     });
 
     await setsConfAPI(saveData);

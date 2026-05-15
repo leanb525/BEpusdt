@@ -64,8 +64,13 @@ func (Dashboard) Home(ctx *gin.Context) {
 }
 
 func buildDashboardHome(req homeReq, rangeKey string, from, to time.Time, loc *time.Location) gin.H {
+	// 只 Select 聚合需要的列，避开 Order 全字段（notify_url/return_url/name 等长 varchar）；
+	// 30 天 × 上万行时单次响应体差 10 倍以上，cache miss 时收益最大
 	var rows = make([]model.Order, 0)
-	model.Db.Where("fiat = ? and created_at >= ? and created_at <= ?", req.Fiat, from, to).Find(&rows)
+	model.Db.Model(&model.Order{}).
+		Select("status, money, amount, crypto, trade_type, notify_state, created_at").
+		Where("fiat = ? and created_at >= ? and created_at <= ?", req.Fiat, from, to).
+		Find(&rows)
 
 	var totalCount, pendingCount, confirmingCount, successCount, expiredCount, failedCount, notifyFailedCount int64
 	gmvPaid := decimal.Zero
